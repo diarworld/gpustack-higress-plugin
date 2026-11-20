@@ -1,0 +1,122 @@
+# Multi-stage Dockerfile for GPUStack Higress Plugins Server -- kaniko build.
+#
+# Same output as the original Dockerfile (a python:3.11-slim runtime serving
+# the bundled wasm plugins on :8080), minus the two things kaniko cannot run:
+# a RUN heredoc and a bind mount. The wheel build steps moved into
+# scripts/build_wheel_kaniko.sh, and oras is compiled in the Go stage instead
+# of being bind-mounted from ghcr.
+#
+# Base images ride the local artifactory mirror: the cluster IP is blocked at
+# auth.docker.io (429 on the token endpoint), so every docker.io base is
+# pulled from docker-local-dataplatform.art.lmru.tech (mirrored by
+# mirror-plugin-builders.yaml).
+#
+# Usage:
+#   kaniko: --dockerfile=DOCKERFILE.kaniko --context=<repo checkout>
+#           --destination=<registry>/gpustack/higress-plugins:<version>
+#   The runtime image keeps the built wheel in /usr/local/lib/wheels/ so
+#   downstream delta builds (the gpustack server image) can COPY --from it
+#   and pip-install the exact same package version.
+
+# Stage 1: Build Go plugins (+ the oras binary for remote plugin fetch)
+FROM docker-local-dataplatform.art.lmru.tech/gpustack/mirrored-golang:1.24-alpine AS go-builder
+ARG GOPROXY
+ENV GOPROXY=${GOPROXY:-https://proxy.golang.org,https://goproxy.cn,direct}
+RUN apk add --no-cache git make bash
+
+WORKDIR /project
+
+COPY extensions/ extensions/
+
+# Build all local Go plugins (PYTHON=true skips metadata generation -- done
+# in whl-builder), then compile oras from source so no extra image is needed.
+RUN cd extensions && make build-all RUNTIME=go PYTHON=true && \
+    rm -rf */*.go */go.mod */go.sum
+RUN go install github.com/oras-project/oras/cmd/oras@v1.3.1
+
+# Stage 1b: Build Rust plugins (wasm-rust; no Docker daemon available here,
+# so cargo runs directly via CARGO_DIRECT=1)
+FROM docker-local-dataplatform.art.lmru.tech/gpustack/mirrored-rust:1.82 AS rust-builder
+RUN rustup target add wasm32-wasip1 \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends clang llvm lld \
+    && echo 'deb http://deb.debian.org/debian trixie main' > /etc/apt/sources.list.d/trixie.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends -t trixie wasi-libc \
+    && rm /etc/apt/sources.list.d/trixie.list \
+    && rm -rf /var/lib/apt/lists/*
+ENV CC_wasm32_wasip1=clang \
+    AR_wasm32_wasip1=llvm-ar \
+    CFLAGS_wasm32_wasip1="--target=wasm32-wasi -isystem /usr/include/wasm32-wasi"
+
+WORKDIR /project
+
+COPY extensions/ extensions/
+
+# Build all local Rust plugins (PYTHON=true skips metadata generation)
+RUN cd extensions && make build-all RUNTIME=rust PYTHON=true CARGO_DIRECT=1 && \
+    rm -rf */target
+
+# Stage 2: Build Python wheel package
+FROM docker-local-dataplatform.art.lmru.tech/gpustack/mirrored-python:3.11-slim AS whl-builder
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl python3-venv bash && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy Python package files and config from host
+COPY pyproject.toml README.md uv.lock ./
+COPY gpustack_higress_plugins/ ./gpustack_higress_plugins/
+COPY scripts/ scripts/
+# Copy extensions metadata from go-builder (VERSION files + remote_plugins.yaml,
+# Go source files already removed there); used by verify_whl.py
+COPY --from=go-builder /project/extensions/ ./extensions/
+
+# Copy built Go plugins from builder stage
+COPY --from=go-builder /project/gpustack_higress_plugins/plugins ./gpustack_higress_plugins/plugins
+
+# Copy built Rust plugins from rust-builder stage (merged into the same dir)
+COPY --from=rust-builder /project/gpustack_higress_plugins/plugins ./gpustack_higress_plugins/plugins
+
+# oras was compiled in the go-builder stage (no bind mount from ghcr here)
+COPY --from=go-builder /go/bin/oras /usr/local/bin/oras
+
+# Build the wheel: metadata, remote plugins, manifest, wheel, verification
+RUN bash scripts/build_wheel_kaniko.sh
+
+# Stage 3: Output stage (scratch for extracting whl files)
+FROM scratch AS whl-output
+COPY --from=whl-builder /dist/ /
+
+# Stage 4: Create final runtime image
+FROM docker-local-dataplatform.art.lmru.tech/gpustack/mirrored-python:3.11-slim AS runtime
+
+WORKDIR /app
+
+# Copy built wheel from whl-builder stage
+COPY --from=whl-builder /dist /tmp/dist/
+# Keep the wheel for downstream delta builds (gpustack server image)
+COPY --from=whl-builder /dist /usr/local/lib/wheels/
+
+# Install the wheel (contains all plugins and code)
+RUN pip install --no-cache-dir --break-system-packages /tmp/dist/*.whl && \
+    rm -rf /tmp/dist
+
+# Create a non-root user
+RUN useradd -m -u 1000 plugins && \
+    chown -R plugins:plugins /app
+
+USER plugins
+
+# Expose port
+EXPOSE 8080
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD python -c "from urllib.request import urlopen; urlopen('http://localhost:8080/', timeout=2)" || exit 1
+
+# Set default command to start the plugin server
+CMD ["gpustack-plugins", "start", "--port", "8080", "--host", "0.0.0.0"]
