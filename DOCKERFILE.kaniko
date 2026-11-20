@@ -31,10 +31,12 @@ COPY extensions/ extensions/
 # Build all local Go plugins (PYTHON=true skips metadata generation -- done
 # in whl-builder), then compile oras from source so no extra image is needed.
 # oras v1.2.2 is the newest line whose go.mod builds with the go 1.24
-# toolchain here (GOTOOLCHAIN=local); v1.3.x needs go >= 1.26.
+# toolchain here (GOTOOLCHAIN=local); v1.3.x needs go >= 1.26. The module
+# path is oras.land/oras for the v1.2 line (the github.com path only
+# exists from v1.3 on).
 RUN cd extensions && make build-all RUNTIME=go PYTHON=true && \
     rm -rf */*.go */go.mod */go.sum
-RUN go install github.com/oras-project/oras/cmd/oras@v1.2.2
+RUN go install oras.land/oras/cmd/oras@v1.2.2
 
 # Stage 1b: Build Rust plugins (wasm-rust; no Docker daemon available here,
 # so cargo runs directly via CARGO_DIRECT=1)
