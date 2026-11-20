@@ -55,6 +55,16 @@ type PluginConfig struct {
 	// boundaries across combinations.
 	Timezone string `json:"timezone,omitempty"`
 
+	// ConcurrencyStaleSeconds is the age at which an in-flight request is
+	// assumed dead and its concurrency slot is reclaimed. It backs two
+	// defenses: the ZSET prune on every acquire and the key TTL. Defaults
+	// to defaultConcurrencyStaleSeconds when unset or non-positive. It
+	// bounds how long a client's slot stays occupied if the release at
+	// stream end never fires (VM crash, host teardown), so it also caps how
+	// long a request may legitimately run before its slot is given away:
+	// streams expected to outlive the default should raise it.
+	ConcurrencyStaleSeconds int64 `json:"concurrency_stale_seconds,omitempty"`
+
 	// Backend is the rate-limit storage backend (not part of JSON).
 	// Set to a redisBackend when "redis" is present in config, otherwise localBackend.
 	Backend LimitBackend `json:"-"`
@@ -436,6 +446,14 @@ type LimitCombination struct {
 
 	// TokenQuota is the calendar-aligned token-count quota.
 	TokenQuota *QuotaSpec `json:"token_quota,omitempty"`
+
+	// ConcurrencyLimits caps the number of simultaneous (in-flight) requests
+	// matched by this combination. Unlike the window kinds it is not a rate:
+	// a slot is taken at the request phase (acquire) and freed when the
+	// stream ends (release), so the counter tracks requests that are running
+	// right now. The limit is resolved per request from the model name the
+	// AI routing injected into x-higress-llm-model (see ConcurrencySpec).
+	ConcurrencyLimits *ConcurrencySpec `json:"concurrency_limits,omitempty"`
 }
 
 // PeriodKind enumerates the calendar period a QuotaSpec resets on.
@@ -612,6 +630,98 @@ func (p *calendarPeriod) KeyPart() string {
 	return string(p.kind)
 }
 
+// ============================================
+// Concurrency limit (in-flight request count)
+// ============================================
+
+// Concurrency bounds on the Redis key and the per-model map. The map rides
+// inside the combo JSON (which the reconciler publishes within a byte
+// budget), and each key becomes a Redis key fragment, so both are capped
+// rather than trusted unbounded.
+const (
+	concurrencyMaxModelEntries  = 100
+	concurrencyMaxModelNameLen  = 256
+	concurrencyMinStaleSeconds  = 60
+	defaultConcurrencyStaleSecs = int64(3600)
+)
+
+// ConcurrencySpec caps how many requests matched by a combination may run at
+// the same time, resolved per request from the model name.
+//
+// Two layers:
+//   - Default -- the limit for any model not named in Models. Nil means "no
+//     default": only explicitly named models are capped.
+//   - Models -- per-model overrides keyed by the value of the
+//     x-higress-llm-model request header (the model name as the client
+//     called it). A stored 0 means "no limit for this model" and wins over
+//     Default -- the explicit escape hatch; an absent key falls back.
+//
+// Accounting differs from the window kinds: the request phase ACQUIRES a
+// slot (mode check_and_add with the stale window below) and the response
+// phase RELEASES it (mode release, ZREM by request id). The ZSET therefore
+// holds one member per running request, and the stale window prunes slots
+// whose release never fired.
+type ConcurrencySpec struct {
+	// Default is the in-flight cap for models not listed in Models.
+	Default *int `json:"default,omitempty"`
+
+	// Models maps a model name to its own in-flight cap; 0 disables the cap
+	// for that model.
+	Models map[string]int `json:"models,omitempty"`
+
+	// Compile artefact (not part of JSON): Compile ran on this spec.
+	compiled bool
+}
+
+// Compile validates the spec. A non-nil error means the configuration is
+// invalid and the plugin should refuse to start.
+func (c *ConcurrencySpec) Compile() error {
+	if c == nil {
+		return errors.New("concurrency_limits: nil spec")
+	}
+	if c.Default != nil && *c.Default < 0 {
+		return fmt.Errorf("concurrency_limits.default must be >= 0, got %d", *c.Default)
+	}
+	if len(c.Models) > concurrencyMaxModelEntries {
+		return fmt.Errorf(
+			"concurrency_limits.models has %d entries, max %d",
+			len(c.Models), concurrencyMaxModelEntries,
+		)
+	}
+	for name, quota := range c.Models {
+		if name == "" || len(name) > concurrencyMaxModelNameLen {
+			return fmt.Errorf(
+				"concurrency_limits.models key must be 1..%d characters, got %d",
+				concurrencyMaxModelNameLen, len(name),
+			)
+		}
+		if quota < 0 {
+			return fmt.Errorf(
+				"concurrency_limits.models[%q] must be >= 0, got %d", name, quota,
+			)
+		}
+	}
+	c.compiled = true
+	return nil
+}
+
+// Resolve returns the effective in-flight cap for one model and whether the
+// model is capped at all. A compiled 0 entry (explicit unlimited) resolves
+// as (0, true): the caller must treat ok-but-zero as "no slot, no check",
+// distinct from (0, false) -- "this spec does not govern this model".
+func (c *ConcurrencySpec) Resolve(model string) (int, bool) {
+	if c == nil || !c.compiled {
+		return 0, false
+	}
+	if quota, ok := c.Models[model]; ok {
+		return quota, true
+	}
+	if c.Default != nil {
+		return *c.Default, true
+	}
+	return 0, false
+}
+
 // RateQuota is a sliding-window quota: the maximum amount allowed within a
 // time window. The structure is neutral and is reused for request-count and
 // token-count limits (and any other "N per window" use case).
@@ -714,6 +824,15 @@ func (c *PluginConfig) Validate() error {
 		return fmt.Errorf("invalid timezone %q: %w", tz, err)
 	}
 	c.location = loc
+	if c.ConcurrencyStaleSeconds <= 0 {
+		c.ConcurrencyStaleSeconds = defaultConcurrencyStaleSecs
+	}
+	if c.ConcurrencyStaleSeconds < concurrencyMinStaleSeconds {
+		return fmt.Errorf(
+			"concurrency_stale_seconds %d below minimum %d",
+			c.ConcurrencyStaleSeconds, concurrencyMinStaleSeconds,
+		)
+	}
 	seen := make(map[string]struct{}, len(c.LimitCombinations))
 	for i := range c.LimitCombinations {
 		combo := &c.LimitCombinations[i]
@@ -728,9 +847,10 @@ func (c *PluginConfig) Validate() error {
 			return fmt.Errorf("limit_combinations[%q].match must not be empty "+
 				"(only fallback combos may omit match rules)", combo.Name)
 		}
-		if combo.QueryLimits == nil && combo.TokenLimits == nil && combo.TokenQuota == nil {
+		if combo.QueryLimits == nil && combo.TokenLimits == nil &&
+			combo.TokenQuota == nil && combo.ConcurrencyLimits == nil {
 			return fmt.Errorf("limit_combinations[%q] must configure at least one of "+
-				"query_limits/token_limits/token_quota", combo.Name)
+				"query_limits/token_limits/token_quota/concurrency_limits", combo.Name)
 		}
 		for j := range combo.Match {
 			if err := combo.Match[j].Compile(); err != nil {
@@ -740,6 +860,11 @@ func (c *PluginConfig) Validate() error {
 		if combo.TokenQuota != nil {
 			if err := combo.TokenQuota.Compile(c.location); err != nil {
 				return fmt.Errorf("limit_combinations[%q].token_quota: %w", combo.Name, err)
+			}
+		}
+		if combo.ConcurrencyLimits != nil {
+			if err := combo.ConcurrencyLimits.Compile(); err != nil {
+				return fmt.Errorf("limit_combinations[%q].concurrency_limits: %w", combo.Name, err)
 			}
 		}
 	}

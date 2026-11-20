@@ -15,17 +15,17 @@ import (
 // LimitEntry describes one combination's sliding-window operation for a BatchEval call.
 type LimitEntry struct {
 	Key    string // pre-built rate-limit key
-	Window int64  // sliding-window size in seconds
+	Window int64  // sliding-window size in seconds; for concurrency entries the stale window
 	Quota  int    // max count/tokens allowed within the window
-	Mode   string // modeCheckAndAdd | modeCheck | modeAdd
+	Mode   string // modeCheckAndAdd | modeCheck | modeAdd | modeRelease
 	Member string // unique per-request identifier (uuid)
-	Count  int64  // 1 for QueryLimits; actual total_tokens for TokenLimits/TokenQuota
+	Count  int64  // 1 for QueryLimits and concurrency; actual total_tokens for TokenLimits/TokenQuota
 	TTL    int64  // backend key expiry in seconds
 
 	// Metric labels: pre-computed alongside Key in collectChecks so the
 	// metrics path doesn't need to re-parse the Redis key string.
 	Combo  string // combination name from config (combo.Name)
-	Kind   string // metricKindQuery / metricKindTokenRolling / metricKindTokenCalendar
+	Kind   string // metricKindQuery / metricKindTokenRolling / metricKindTokenCalendar / metricKindConcurrency
 	Period string // window/period suffix used in the Redis key, e.g. "1s", "60s", "each_month"
 	Bucket string // dimension fragment (everything past <rule>|<combo>) joined with '|'; sanitized at emit time
 }
@@ -49,7 +49,8 @@ type EvalResult struct {
 //	Pass 1 – for every check/check_and_add entry: prune stale members, sum counts,
 //	         compare to quota. On the first over-quota entry, invoke callback with
 //	         LIMITED and return; no entries are written.
-//	Pass 2 – for every check_and_add/add entry: write count with TTL.
+//	Pass 2 – for every check_and_add/add entry: write count with TTL. Release
+//	         entries (concurrency) remove the request's member instead.
 //
 // Passing a nil callback is valid (fire-and-forget; used in the response phase).
 type LimitBackend interface {
@@ -138,8 +139,10 @@ type localBackend struct{}
 //
 // Pass 1 (check): reads the current window state for every check/check_and_add entry.
 // On the first over-quota entry callback(LIMITED) is called and the method returns.
+// Release entries participate in neither pass's check.
 // Pass 2 (write): appends a new entry for every check_and_add/add entry using a
-// CAS retry loop for per-key thread safety.
+// CAS retry loop for per-key thread safety, and removes the member for
+// release entries (concurrency slot freeing).
 //
 // Action semantics: unlike the async redisBackend, the callback fires *synchronously*
 // inside this method. When it triggers a rejection it has already invoked
@@ -159,7 +162,29 @@ func (b *localBackend) BatchEval(now int64, entries []LimitEntry, callback func(
 	// Pass 1: check
 	for i := range entries {
 		e := &entries[i]
-		if e.Mode == modeAdd {
+		if e.Mode == modeAdd || e.Mode == modeRelease {
+			continue
+		}
+		// Concurrency entries read a plain counter, not a window: the slot
+		// total is the number of requests admitted minus released, with no
+		// time dimension (the redis backend prunes by stale age instead --
+		// see the concurrency acquire comment in collectChecks).
+		if e.Kind == metricKindConcurrency {
+			total, err := localCounterGet(e.Key)
+			if err != nil {
+				proxywasm.LogWarnf("%s: local check for key %s failed, fail-open: %v", pluginName, e.Key, err)
+				continue
+			}
+			proxywasm.LogDebugf("%s: local check req=%s key=%s running=%d quota=%d",
+				pluginName, e.Member, e.Key, total, e.Quota)
+			if total >= int64(e.Quota) {
+				proxywasm.LogDebugf("%s: local limited req=%s key=%s running=%d quota=%d",
+					pluginName, e.Member, e.Key, total, e.Quota)
+				if callback != nil {
+					callback(EvalResult{Status: luaLimitedReply, LimitedKey: e.Key})
+				}
+				return types.ActionPause, nil
+			}
 			continue
 		}
 		total, err := localWindowTotal(e.Key, now, e.Window)
@@ -182,6 +207,19 @@ func (b *localBackend) BatchEval(now int64, entries []LimitEntry, callback func(
 	for i := range entries {
 		e := &entries[i]
 		if e.Mode == modeCheck {
+			continue
+		}
+		if e.Mode == modeRelease {
+			// Absent key -> nothing to free; never goes negative.
+			if err := localCounterAdjust(e.Key, -1); err != nil {
+				proxywasm.LogWarnf("%s: local release for key %s failed: %v", pluginName, e.Key, err)
+			}
+			continue
+		}
+		if e.Kind == metricKindConcurrency {
+			if err := localCounterAdjust(e.Key, 1); err != nil {
+				proxywasm.LogWarnf("%s: local acquire for key %s failed: %v", pluginName, e.Key, err)
+			}
 			continue
 		}
 		if err := localAddEntry(e.Key, now, e.Count, e.Window); err != nil {
@@ -268,6 +306,63 @@ func localAddEntry(key string, now, count, window int64) error {
 		if errors.Is(err, types.ErrorStatusCasMismatch) {
 			proxywasm.LogDebugf("%s: local CAS conflict key=%s attempt=%d, retrying", pluginName, key, attempt+1)
 			continue // another worker modified the key; retry with fresh CAS
+		}
+		return err
+	}
+	return fmt.Errorf("CAS retry limit exceeded for key %s", key)
+}
+
+// ============================================================
+// Shared-data concurrency counter helpers
+// ============================================================
+//
+// The local backend stores a concurrency slot count as one 8-byte big-endian
+// int64, unlike the 16-byte window entries. There is no per-member identity:
+// acquire increments, release decrements, and the counter can only reset
+// with the VM (a documented local-mode property -- the redis backend is the
+// one that prunes stale slots individually).
+
+// localCounterGet reads the counter at key; a missing key reads 0.
+func localCounterGet(key string) (int64, error) {
+	data, _, err := proxywasm.GetSharedData(key)
+	if errors.Is(err, types.ErrorStatusNotFound) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if len(data) < 8 {
+		return 0, nil
+	}
+	return int64(binary.BigEndian.Uint64(data)), nil
+}
+
+// localCounterAdjust adds delta to the counter at key, clamped at zero so a
+// release for an already-gone counter (VM rebuilt, key evicted) never
+// produces a negative total that would over-admit later requests. The CAS
+// retry loop matches localAddEntry so concurrent workers serialize.
+func localCounterAdjust(key string, delta int64) error {
+	for attempt := 0; attempt < localMaxCASRetries; attempt++ {
+		data, cas, err := proxywasm.GetSharedData(key)
+		if err != nil && !errors.Is(err, types.ErrorStatusNotFound) {
+			return err
+		}
+		var current int64
+		if err == nil && len(data) >= 8 {
+			current = int64(binary.BigEndian.Uint64(data))
+		}
+		adjusted := current + delta
+		if adjusted < 0 {
+			adjusted = 0
+		}
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint64(buf, uint64(adjusted))
+		err = proxywasm.SetSharedData(key, buf, cas)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, types.ErrorStatusCasMismatch) {
+			continue
 		}
 		return err
 	}

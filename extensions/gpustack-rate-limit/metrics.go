@@ -18,6 +18,7 @@ const (
 	metricKindQuery         = "query"
 	metricKindTokenRolling  = "token_rolling"
 	metricKindTokenCalendar = "token_calendar"
+	metricKindConcurrency   = "concurrency"
 
 	// result label values for request_total.
 	metricResultPassed  = "passed"

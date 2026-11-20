@@ -17,11 +17,14 @@ as one or more `limit_combinations`. Each combination declares:
   - **`token_limits`** -- rolling-window AI token-count quota.
   - **`token_quota`** -- calendar-aligned AI token quota (per calendar day /
     month / year, anchored to a configurable timezone).
+  - **`concurrency_limits`** -- cap on simultaneous in-flight requests,
+    resolved per model.
 
 Rolling-window limits use a sliding window of fixed duration. Calendar-aligned
 quotas reset on the natural calendar boundary (e.g. 1st of every month at
 00:00 in the configured timezone) and are intended for monthly / yearly token
-allowances that line up with billing cycles.
+allowances that line up with billing cycles. Concurrency limits are not a rate
+at all: a slot is taken while a request runs and freed when its stream ends.
 
 Request-count limits are checked and recorded atomically at the request phase
 (check-and-add). Token-count limits (both `token_limits` and `token_quota`)
@@ -31,6 +34,12 @@ are:
    quota for the matched combination is already exhausted.
 2. **Recorded** at the response phase: once the stream finishes, the real
    `total_tokens` of the response is added to the counter.
+
+Concurrency limits acquire their slot atomically at the request phase (same
+check-and-add eval as the other limits) and release it in the stream-done
+hook, so the slot frees even for responses that produced no token accounting.
+A slot whose release never fires is reclaimed by the stale window
+(`concurrency_stale_seconds`).
 
 For token accounting the plugin reads `total_tokens` from the Envoy filter-state
 key `ai_log`, which is published by upstream AI plugins (Higress `ai-statistics`
@@ -75,6 +84,7 @@ This matches the runtime properties of Higress's `ai-token-ratelimit` plugin.
 | `enable_on_path_suffix`    | array of string     | No       | AI endpoints\*\*     | Only enforce the limit when `:path` ends with one of these suffixes (after stripping the query string). `"*"` matches any path.                  |
 | `enable_on_path_prefix`    | array of string     | No       | `["/model/proxy"]`   | Only enforce the limit when `:path` starts with one of these prefixes. An empty string `""` matches any path.                                    |
 | `timezone`                 | string              | No       | `UTC`                | IANA timezone name (e.g. `Asia/Shanghai`) used to anchor every calendar-aligned `token_quota` boundary in this config. Deployment-wide.          |
+| `concurrency_stale_seconds` | int                | No       | `3600`               | Age at which an in-flight request is assumed dead and its concurrency slot reclaimed: bounds the ZSET prune on every acquire and the key TTL (2x). Raise it for streams expected to legitimately outlive the default. Minimum `60`. |
 | `redis`                    | object              | No       | -                    | Redis connection settings. When omitted the plugin runs in **local mode** (per-instance counters). See [Backend Modes](#backend-modes).          |
 
 \* Global-level configuration is allowed to omit `limit_combinations` -- in that
@@ -126,8 +136,9 @@ keeping the other one; the overall enable decision is the OR of both lists.
 | `query_limits`  | object           | No\*     | -       | Rolling-window request-count quota (see [RateQuota](#ratequota-fields)). Triggers check-and-add at the request phase.      |
 | `token_limits`  | object           | No\*     | -       | Rolling-window AI token-count quota. Triggers check at the request phase and add at the response phase.                    |
 | `token_quota`   | object           | No\*     | -       | Calendar-aligned AI token quota (see [QuotaSpec](#quotaspec-fields)). Same check / add lifecycle as `token_limits`.         |
+| `concurrency_limits` | object      | No\*     | -       | Cap on simultaneous in-flight requests (see [ConcurrencySpec fields](#concurrencyspec-fields)). Acquire at the request phase, release at stream end. |
 
-\* At least one of `query_limits` / `token_limits` / `token_quota` must be configured per combination.
+\* At least one of `query_limits` / `token_limits` / `token_quota` / `concurrency_limits` must be configured per combination.
 
 \*\* `match` may be omitted (or set to an empty array) **only** when `is_fallback: true`. A fallback combo with no match rules applies to every request the plugin sees; see [Fallback combos](#fallback-combos).
 
@@ -264,6 +275,61 @@ plugin sets TTL to `period_end - now + 300s` (5-minute grace), so the
 key always lives until the period ends regardless of how early in the
 period the first write happens. Rolling-window combos still use
 `window * 2` as before.
+
+### ConcurrencySpec fields
+
+A cap on **simultaneous in-flight requests**, resolved per request from the
+model name the AI routing injected into `x-higress-llm-model`. Unlike the
+window kinds it is not a rate: the request phase **acquires** a slot
+(check-and-add of the request's UUID into a per-model ZSET) and the response
+phase **releases** it (ZREM at stream done). The counter therefore tracks
+requests that are running *right now*, not requests per window.
+
+| Field     | Type           | Required | Default | Description                                                                                                     |
+| --------- | -------------- | -------- | ------- | --------------------------------------------------------------------------------------------------------------- |
+| `default` | int            | No       | -       | In-flight cap for any model **not** named in `models`. Omit to cap only explicitly named models.                 |
+| `models`  | map[string]int | No       | -       | Per-model overrides keyed by the `x-higress-llm-model` value. A stored `0` means **unlimited** for that model and wins over `default`. Max 100 entries, keys 1..256 chars. |
+
+Resolution order for one request's model `M`: `models[M]` if present, else
+`default`, else the spec does not cap `M` at all. A resolved cap of `0`
+(explicit unlimited) admits without acquiring a slot. A request whose model
+header is missing is capped under the shared `none` model name rather than
+bypassing the cap.
+
+Slots whose release never fires (VM crash, host teardown) are reclaimed by the
+stale window: every acquire prunes members older than the top-level
+`concurrency_stale_seconds`, and the key TTL is twice that. Streams expected
+to legitimately run longer than the default hour should raise
+`concurrency_stale_seconds`.
+
+The GPUStack server builds one combo per user with this block; an admin user's
+combo simply omits `concurrency_limits`, which makes the admin exempt
+(fallback suppression: the admin combo is a non-fallback match, so the
+fallback default never applies to them).
+
+```yaml
+limit_combinations:
+  - name: user-6
+    match:
+      - source: consumer
+        value: regexp_capture:^(?:[^.]+\.)?(gpustack-.+)$
+    concurrency_limits:
+      default: 1
+      models:
+        glm-5.3-flash: 4
+        embedding-model: 0
+```
+
+#### Concurrency quota internals
+
+The Redis key suffix is `c:<model>` (e.g. `...|c:glm-5.3-flash`), so per-model
+slots share nothing across models. The ZSET holds one `<request-uuid>|1`
+member per running request with the acquire timestamp as score; the acquire
+prune (`ZREMRANGEBYSCORE` below `now - stale`) is what frees abandoned slots,
+and `rejected_total{kind="concurrency"}` / `value_total{kind="concurrency"}`
+carry the same labels as the other kinds. In local mode the slot count is a
+plain per-key int64 counter (acquire +1, release -1, clamped at zero) — see
+[Local mode limitations](#local-mode-limitations).
 
 ### Fallback combos
 
@@ -412,7 +478,7 @@ route.<route>.upstream.<cluster>.model.<model>.consumer.<consumer>.metric.gpusta
 | `metric`   | One of the three counter names above                                                    |
 | `rule`     | Top-level `rule_name`                                                                   |
 | `combo`    | The matched `limit_combinations[].name`                                                 |
-| `kind`     | `query` / `token_rolling` / `token_calendar`                                            |
+| `kind`     | `query` / `token_rolling` / `token_calendar` / `concurrency`                             |
 | `period`   | Window/period suffix. For rolling kinds: `1s` / `60s` / `3600s` / `86400s` / `<custom>s`. For `token_calendar`: `each_day` / `each_month` / `each_year`. Disambiguates per-window emissions when one combo declares multiple windows on the same kind. |
 | `bucket`   | Sanitised dimension fragment (past `<rule>\|<combo>` in the Redis key)                  |
 | `result`   | `passed` / `limited` (only on `request_total`)                                          |
@@ -689,6 +755,7 @@ token budgets tied to billing), always configure `redis`.
 | Cluster-wide quota enforcement | Yes | No — per-replica only |
 | `token_quota` calendar alignment | Exact across all replicas | Each replica resets independently; the aggregate reset is still wall-clock-aligned but each instance's budget is independent |
 | Cross-key atomicity (multi-combination) | Yes (single Lua Eval) | Best-effort — brief over-admission possible at quota boundary under high concurrency |
+| `concurrency_limits` slot identity | Per-request members; stale-window prune reclaims abandoned slots exactly | Plain per-key counter: acquire +1 / release -1, no member identity — an abandoned slot (crash between acquire and release) is lost until the VM restarts |
 | External reconciliation / monitoring | Via Redis ZSET | Not available |
 
 ## Redis Key Layout
@@ -707,11 +774,14 @@ built as:
   - For calendar quotas (`token_quota`): the stable period label, e.g.
     `each_month`, `each_year`. The deployment timezone is **not** encoded
     into the key -- it is a top-level constant.
+- For `concurrency_limits` the key ends with `c:<model>` instead of
+  `<kind>:<period>`: one ZSET per (combo, model), where `<model>` is the raw
+  `x-higress-llm-model` value (or `none` when the header is absent).
 - Each dimension fragment is `<source>:<name>=<value>` (or `<source>=<value>`
   when `name` is empty / for `consumer`).
 - ZSET member is `<request-uuid>|<count>`: `1` for request-count limits,
-  `total_tokens` for token-count limits and token quotas. ZSET score is the
-  epoch second.
+  `total_tokens` for token-count limits and token quotas, `1` for concurrency
+  slots. ZSET score is the epoch second.
 
 Example keys:
 
@@ -720,6 +790,7 @@ myrule|premium-gpt4|header:x-api-key=premium-abc-123|param:model=gpt-4|q:60s
 myrule|premium-gpt4|header:x-api-key=premium-abc-123|param:model=gpt-4|t:60s
 myrule|premium-gpt4|consumer=tenant-a|t:each_month
 myrule|premium-gpt4|consumer=tenant-a|t:each_year
+myrule|user-6|consumer=gpustack-6|c:glm-5.3-flash
 ```
 
 ### Reconciliation with external systems (e.g. GPUStack)
@@ -1131,6 +1202,12 @@ spec:
   the response phase means concurrent requests can occasionally exceed the
   quota by a small amount; this is the same trade-off every production token
   limiter makes (applies to both Redis and local modes).
+- **Concurrency release delivery**: the release ZREM runs in the stream-done
+  hook and is fire-and-forget; a release that never lands (VM teardown between
+  acquire and done, dispatch error) is reclaimed by the stale-window prune on
+  the next acquire rather than by an explicit retry. Rejected requests never
+  hold a slot: the acquire is part of the same atomic eval as the check, and a
+  LIMITED verdict writes nothing.
 - **Cross-plugin ordering**: if you deploy both `ai-statistics` (or
   `gpustack-token-usage`) and `gpustack-rate-limit`, make sure the statistics
   plugin publishes `ai_log` before this plugin's response-phase hook runs. The

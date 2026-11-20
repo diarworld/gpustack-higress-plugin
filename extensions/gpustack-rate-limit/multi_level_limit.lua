@@ -4,12 +4,17 @@
 -- ARGV[1]:    current timestamp (epoch seconds, shared across all combinations)
 -- ARGV[2..]:  per-combination 6-tuple [window_seconds, quota, mode, member_id, count, ttl]
 --
---   mode:      "check_and_add" check + record     (typical for request-count limits)
+--   mode:      "check_and_add" check + record     (request-count limits and
+--                                                  concurrency acquire: prune,
+--                                                  count, conditional ZADD)
 --              "check"         check only         (request-phase token check)
 --              "add"           record only        (response-phase token recording)
+--              "release"       remove member      (response-phase concurrency
+--                                                  release: ZREM of the request's
+--                                                  member; no-op if absent)
 --   member_id: base id for ZADD (usually a per-request UUID)
---   count:     weight to record for this request; 1 for request-count, total_tokens
---              for token-count.
+--   count:     weight to record for this request; 1 for request-count and
+--              concurrency, total_tokens for token-count.
 --   ttl:       Redis key TTL in seconds, set on every write (add / check_and_add).
 --              Decoupled from "window" because calendar-aligned quotas pass a
 --              dynamic short window (now - period_start) which would otherwise
@@ -71,11 +76,20 @@ for _, combo in ipairs(combinations) do
     end
 end
 
--- Pass 2: record every combination that needs recording (check-only is skipped).
+-- Pass 2: record every combination that needs recording (check-only is skipped),
+-- and release members for concurrency cleanup.
 for _, combo in ipairs(combinations) do
     if combo.mode == 'add' or combo.mode == 'check_and_add' then
         redis.call('ZADD', combo.key, now, combo.member .. '|' .. combo.count)
         redis.call('EXPIRE', combo.key, combo.ttl)
+    elseif combo.mode == 'release' then
+        -- ZREM targets the encoded "<member>|<count>" form the acquire wrote
+        -- (count is 1 for concurrency slots). ZREM of an absent member is a
+        -- no-op, so releasing a slot that was never acquired (the request was
+        -- rejected before any write) is safe. The prune above runs with the
+        -- stale window passed by the caller, reclaiming slots whose release
+        -- never fired.
+        redis.call('ZREM', combo.key, combo.member .. '|' .. combo.count)
     end
 end
 

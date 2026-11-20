@@ -49,7 +49,7 @@ func TestCollectChecksOrderingAndModes(t *testing.T) {
 
 	headers := [][2]string{{"x-api-key", "k1"}}
 	reqID := "req-xyz"
-	entries, pending := collectChecks(cfg, headers, reqID, time.Now())
+	entries, pending, _ := collectChecks(cfg, headers, reqID, time.Now())
 
 	// Expected entries: query-only (1 q) + token-only (1 t) + both (1 q + 1 t) = 4
 	wantKeys := []string{
@@ -76,10 +76,10 @@ func TestCollectChecksOrderingAndModes(t *testing.T) {
 		count  int64
 		ttl    int64
 	}{
-		{60, 100, modeCheckAndAdd, 1, 120},    // query-only
-		{60, 200000, modeCheck, 0, 120},        // token-only
-		{60, 50, modeCheckAndAdd, 1, 120},      // both-query
-		{60, 1000, modeCheck, 0, 120},          // both-token
+		{60, 100, modeCheckAndAdd, 1, 120}, // query-only
+		{60, 200000, modeCheck, 0, 120},    // token-only
+		{60, 50, modeCheckAndAdd, 1, 120},  // both-query
+		{60, 1000, modeCheck, 0, 120},      // both-token
 	}
 	for i, w := range wantTuples {
 		if entries[i].Window != w.window {
@@ -148,7 +148,7 @@ func TestCollectChecksFallbackSuppressedWhenOverrideMatches(t *testing.T) {
 		t.Fatalf("Validate(): %v", err)
 	}
 
-	entries, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "vip-1"}}, "rid", time.Now())
+	entries, _, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "vip-1"}}, "rid", time.Now())
 	if len(entries) != 1 {
 		t.Fatalf("len(entries)=%d, want 1 (override only, default suppressed)", len(entries))
 	}
@@ -185,7 +185,7 @@ func TestCollectChecksFallbackFiresWhenNoOverrideMatches(t *testing.T) {
 	}
 
 	// A non-VIP request: vip-override misses, default fires.
-	entries, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "alice"}}, "rid", time.Now())
+	entries, _, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "alice"}}, "rid", time.Now())
 	if len(entries) != 1 {
 		t.Fatalf("len(entries)=%d, want 1 (default fires)", len(entries))
 	}
@@ -226,7 +226,7 @@ func TestCollectChecksMultipleFallbacksAllFire(t *testing.T) {
 		t.Fatalf("Validate(): %v", err)
 	}
 
-	entries, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "alice"}}, "rid", time.Now())
+	entries, _, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "alice"}}, "rid", time.Now())
 	if len(entries) != 2 {
 		t.Fatalf("len(entries)=%d, want 2 (both fallbacks fire)", len(entries))
 	}
@@ -269,13 +269,13 @@ func TestCollectChecksFallbackWithMatchRulesStillSuppressed(t *testing.T) {
 	}
 
 	// VIP request: both combos' match rules hit, but the fallback is suppressed.
-	vipEntries, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "gpustack-vip"}}, "rid", time.Now())
+	vipEntries, _, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "gpustack-vip"}}, "rid", time.Now())
 	if len(vipEntries) != 1 || vipEntries[0].Combo != "vip-override" {
 		t.Errorf("VIP entries=%+v, want only vip-override", vipEntries)
 	}
 
 	// Non-VIP gpustack user: only the fallback's match rule hits, so it fires.
-	nonVipEntries, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "gpustack-7"}}, "rid", time.Now())
+	nonVipEntries, _, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "gpustack-7"}}, "rid", time.Now())
 	if len(nonVipEntries) != 1 || nonVipEntries[0].Combo != "default-per-user" {
 		t.Errorf("non-VIP entries=%+v, want only default-per-user", nonVipEntries)
 	}
@@ -292,7 +292,7 @@ func TestCollectChecksAllCombosMiss(t *testing.T) {
 			},
 		},
 	}
-	entries, pending := collectChecks(cfg, [][2]string{{"x", "actual"}}, "rid", time.Now())
+	entries, pending, _ := collectChecks(cfg, [][2]string{{"x", "actual"}}, "rid", time.Now())
 	if len(entries) != 0 {
 		t.Errorf("entries=%v, want empty", entries)
 	}
@@ -325,7 +325,7 @@ func TestCollectChecksMultiDimensionKey(t *testing.T) {
 		{"x-api-key", "premium-abc"},
 		{":path", "/chat?model=gpt-4"},
 	}
-	entries, _ := collectChecks(cfg, headers, "rid", time.Now())
+	entries, _, _ := collectChecks(cfg, headers, "rid", time.Now())
 	if len(entries) != 1 {
 		t.Fatalf("len(entries)=%d, want 1", len(entries))
 	}
@@ -347,7 +347,7 @@ func TestCollectChecksSkipsQuotaWithoutWindow(t *testing.T) {
 			},
 		},
 	}
-	entries, _ := collectChecks(cfg, [][2]string{{"x", "v"}}, "rid", time.Now())
+	entries, _, _ := collectChecks(cfg, [][2]string{{"x", "v"}}, "rid", time.Now())
 	if len(entries) != 0 {
 		t.Errorf("expected no entries for an empty quota, got %v", entries)
 	}
@@ -376,7 +376,7 @@ func TestCollectChecksTokenQuotaCalendar(t *testing.T) {
 	}
 
 	headers := [][2]string{{"x-mse-consumer", "tenant-a"}}
-	entries, pending := collectChecks(cfg, headers, "req-xyz", time.Now())
+	entries, pending, _ := collectChecks(cfg, headers, "req-xyz", time.Now())
 
 	// Three entries: rolling token + monthly quota + yearly quota.
 	// Top-level Timezone is NOT encoded into the key -- it's a deployment-wide constant.
@@ -473,7 +473,7 @@ func TestCollectChecksMultiPeriodQueryLimits(t *testing.T) {
 	}
 
 	headers := [][2]string{{"x-api-key", "k1"}}
-	entries, pending := collectChecks(cfg, headers, "rid", time.Now())
+	entries, pending, _ := collectChecks(cfg, headers, "rid", time.Now())
 	if len(entries) != 3 {
 		t.Fatalf("len(entries)=%d, want 3", len(entries))
 	}
@@ -538,7 +538,7 @@ func TestCollectChecksMultiPeriodTokenLimits(t *testing.T) {
 		t.Fatalf("Validate(): %v", err)
 	}
 
-	entries, pending := collectChecks(cfg, [][2]string{{"x-api-key", "k1"}}, "rid", time.Now())
+	entries, pending, _ := collectChecks(cfg, [][2]string{{"x-api-key", "k1"}}, "rid", time.Now())
 	if len(entries) != 2 || len(pending) != 2 {
 		t.Fatalf("len(entries)=%d len(pending)=%d, want 2 each", len(entries), len(pending))
 	}
@@ -591,7 +591,7 @@ func TestCollectChecksMultiPeriodTokenQuota(t *testing.T) {
 	}
 
 	headers := [][2]string{{"x-mse-consumer", "alice"}}
-	entries, pending := collectChecks(cfg, headers, "rid", time.Now())
+	entries, pending, _ := collectChecks(cfg, headers, "rid", time.Now())
 	if len(entries) != 2 || len(pending) != 2 {
 		t.Fatalf("len(entries)=%d len(pending)=%d, want 2 each", len(entries), len(pending))
 	}
@@ -926,8 +926,8 @@ func TestCollectChecksRegexpCaptureSharedBucket(t *testing.T) {
 		t.Fatalf("Validate(): %v", err)
 	}
 
-	apiEntries, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "ak-x.gpustack-1"}}, "rid-1", time.Now())
-	uiEntries, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "gpustack-1"}}, "rid-2", time.Now())
+	apiEntries, _, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "ak-x.gpustack-1"}}, "rid-1", time.Now())
+	uiEntries, _, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "gpustack-1"}}, "rid-2", time.Now())
 
 	if len(apiEntries) != 1 || len(uiEntries) != 1 {
 		t.Fatalf("len(apiEntries)=%d len(uiEntries)=%d, want 1 each", len(apiEntries), len(uiEntries))
@@ -1108,7 +1108,7 @@ func TestCollectChecksMetricLabels(t *testing.T) {
 		{"x-mse-consumer", "alice"},
 		{"x-higress-llm-model", "qwen3-0.6b"},
 	}
-	entries, pending := collectChecks(cfg, headers, "rid", time.Now())
+	entries, pending, _ := collectChecks(cfg, headers, "rid", time.Now())
 	if len(entries) != 3 {
 		t.Fatalf("len(entries)=%d, want 3", len(entries))
 	}
@@ -1174,7 +1174,7 @@ func TestMetricPeriodLabelDisambiguation(t *testing.T) {
 		t.Fatalf("Validate(): %v", err)
 	}
 
-	entries, pending := collectChecks(cfg, [][2]string{{"x-mse-consumer", "alice"}}, "rid", time.Now())
+	entries, pending, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "alice"}}, "rid", time.Now())
 
 	// All entries on this combo share the same (Combo, Bucket); only
 	// (Kind, Period) should distinguish them. Use that pair as a uniqueness
@@ -1215,4 +1215,3 @@ func TestMetricPeriodLabelDisambiguation(t *testing.T) {
 		}
 	}
 }
-

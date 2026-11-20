@@ -29,6 +29,11 @@ const (
 	modeCheckAndAdd = "check_and_add"
 	modeCheck       = "check"
 	modeAdd         = "add"
+	// modeRelease frees a concurrency slot acquired at the request phase:
+	// ZREM of the request's member. Acquire needs no new mode -- it is
+	// exactly check_and_add with the stale window (prune + count + ZADD +
+	// EXPIRE), so the lua script only gains the release branch.
+	modeRelease = "release"
 
 	// ttlGraceSeconds is the safety margin added to calendar-aligned quota
 	// TTLs to absorb clock skew across Higress instances. Modest by design --
@@ -37,9 +42,10 @@ const (
 	ttlGraceSeconds = 300
 
 	// Internal HttpContext keys.
-	ctxKeyRequestID    = "gpustack-rate-limit:request-id"
-	ctxKeyTokenPending = "gpustack-rate-limit:token-pending"
-	ctxKeyAILabels     = "gpustack-rate-limit:ai-labels"
+	ctxKeyRequestID       = "gpustack-rate-limit:request-id"
+	ctxKeyTokenPending    = "gpustack-rate-limit:token-pending"
+	ctxKeyAILabels        = "gpustack-rate-limit:ai-labels"
+	ctxKeyConcurrencyHeld = "gpustack-rate-limit:concurrency-held"
 
 	// Header conventions used to populate aiLabels.Model / aiLabels.Consumer.
 	// x-higress-llm-model is injected by gpustack-set-header-pre-route (or
@@ -109,6 +115,15 @@ type tokenPendingAdd struct {
 	Bucket string
 }
 
+// concurrencyHeld records one concurrency slot this request is occupying,
+// so the response phase can release exactly what was acquired. Key + member
+// identify the ZSET entry; the entry itself was written with count=1 by the
+// same atomic eval that admitted the request.
+type concurrencyHeld struct {
+	Key    string
+	Member string
+}
+
 // windowSeconds returns the lua window argument for the response-phase add.
 func (p *tokenPendingAdd) windowSeconds(now time.Time) int64 {
 	if p.CalendarPeriod.kind != "" {
@@ -161,7 +176,7 @@ func init() {
 		wrapper.ProcessStreamDone(onHttpStreamDone),
 		// Periodically rebuild the VM to avoid long-running memory-leak accumulation.
 		wrapper.WithRebuildAfterRequests[PluginConfig](1000),
-		wrapper.WithRebuildMaxMemBytes[PluginConfig](200 * 1024 * 1024),
+		wrapper.WithRebuildMaxMemBytes[PluginConfig](200*1024*1024),
 	)
 }
 
@@ -308,9 +323,12 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Ac
 	ctx.SetContext(ctxKeyAILabels, ai)
 
 	nowTime := time.Now()
-	entries, pending := collectChecks(&config, headers, reqID, nowTime)
+	entries, pending, held := collectChecks(&config, headers, reqID, nowTime)
 	if len(pending) > 0 {
 		ctx.SetContext(ctxKeyTokenPending, pending)
+	}
+	if len(held) > 0 {
+		ctx.SetContext(ctxKeyConcurrencyHeld, held)
 	}
 	if len(entries) == 0 {
 		// Either no combo's match rules hit, or all combos had quota=0/empty
@@ -464,7 +482,19 @@ type matchedCombo struct {
 // for requests that no non-fallback combo also matched, so a per-user
 // override can legitimately raise the effective allowance above the
 // deployment-wide default for the targeted user without affecting others.
-func collectChecks(config *PluginConfig, headers [][2]string, reqID string, nowTime time.Time) (entries []LimitEntry, pending []tokenPendingAdd) {
+
+// concurrencyStale returns the stale window (seconds) for concurrency
+// slots, applying the same normalization as Validate so direct callers of
+// collectChecks (tests, rule-level configs) see the documented default
+// rather than zero.
+func concurrencyStale(config *PluginConfig) int64 {
+	if config.ConcurrencyStaleSeconds > 0 {
+		return config.ConcurrencyStaleSeconds
+	}
+	return defaultConcurrencyStaleSecs
+}
+
+func collectChecks(config *PluginConfig, headers [][2]string, reqID string, nowTime time.Time) (entries []LimitEntry, pending []tokenPendingAdd, held []concurrencyHeld) {
 	var nonFallback, fallback []matchedCombo
 	for i := range config.LimitCombinations {
 		combo := &config.LimitCombinations[i]
@@ -497,6 +527,10 @@ func collectChecks(config *PluginConfig, headers [][2]string, reqID string, nowT
 	if len(active) == 0 {
 		active = fallback
 	}
+
+	// The model name the AI routing injected; every concurrency limit on
+	// every combo resolves against this one value, read once per request.
+	model := findHeaderOrNone(headers, headerLLMModel)
 
 	for _, m := range active {
 		combo := m.combo
@@ -596,8 +630,40 @@ func collectChecks(config *PluginConfig, headers [][2]string, reqID string, nowT
 				Bucket:         bucket,
 			})
 		}
+
+		// ConcurrencyLimits (in-flight): acquire at the request phase,
+		// release at stream done. The mode is check_and_add with the stale
+		// window standing in for a rate window: the ZSET holds one member
+		// per running request, pruned when a member ages past the stale
+		// window (a release that never fired -- crash, teardown -- frees
+		// its slot there), and the key TTL is the same window doubled. The
+		// model fragment in the key is the raw x-higress-llm-model value,
+		// so per-model slots share nothing across models; a request whose
+		// model header is missing lands in the shared "none" bucket rather
+		// than bypassing the cap. Explicitly unlimited models (resolved 0)
+		// contribute no entry at all.
+		if spec := combo.ConcurrencyLimits; spec != nil {
+			if quota, capped := spec.Resolve(model); capped && quota > 0 {
+				stale := concurrencyStale(config)
+				key := strings.Join(append(base, "c:"+model), "|")
+				entries = append(entries, LimitEntry{
+					Key:    key,
+					Window: stale,
+					Quota:  quota,
+					Mode:   modeCheckAndAdd,
+					Member: reqID,
+					Count:  1,
+					TTL:    rollingTTL(stale),
+					Combo:  combo.Name,
+					Kind:   metricKindConcurrency,
+					Period: fmt.Sprintf("%ds", stale),
+					Bucket: bucket + "|model=" + model,
+				})
+				held = append(held, concurrencyHeld{Key: key, Member: reqID})
+			}
+		}
 	}
-	return entries, pending
+	return entries, pending, held
 }
 
 // handleEvalResult handles the backend result for the request phase.
@@ -607,7 +673,8 @@ func collectChecks(config *PluginConfig, headers [][2]string, reqID string, nowT
 // Metric emission rules (see README "Metrics"):
 //   - request_total{result=passed|limited} +1 per request
 //   - On PASSED: value_total{combo,kind,bucket} += entry.Count for every
-//     check_and_add entry (currently only query_limits). Token entries wait
+//     check_and_add entry (query_limits and concurrency acquire; a
+//     concurrency slot counts as 1 admitted request). Token entries wait
 //     for onHttpStreamDone.
 //   - On LIMITED: rejected_total{combo,kind,bucket} +1 for the entry whose
 //     Key matches result.LimitedKey. Lua/local short-circuit guarantees
@@ -743,72 +810,116 @@ func buildRejectedHeaders(config PluginConfig, limitedKey string) [][2]string {
 	}
 }
 
-// onHttpStreamDone runs the response-phase "add" for TokenLimits once the
-// stream has fully ended.
+// onHttpStreamDone runs the response-phase work once the stream has fully
+// ended:
 //
-// total_token is taken from the Envoy filter-state "ai_log", which is published
-// by an upstream AI plugin (ai-statistics / gpustack-token-usage / ...) via
-// wrapper.HttpContext.WriteUserAttributeToLogWithKey(wrapper.AILogKey). This
-// plugin deliberately does not parse the SSE body itself, to avoid duplicating
-// work already done by the upstream plugin.
+//   - The "add" for TokenLimits: total_token is taken from the Envoy
+//     filter-state "ai_log", published by an upstream AI plugin
+//     (ai-statistics / gpustack-token-usage / ...) via
+//     wrapper.HttpContext.WriteUserAttributeToLogWithKey(wrapper.AILogKey).
+//     This plugin deliberately does not parse the SSE body itself, to avoid
+//     duplicating work already done by the upstream plugin.
+//   - The "release" for concurrency slots acquired at the request phase:
+//     ZREM of this request's member, so the slot frees even when the
+//     response produced no token accounting (early upstream failure,
+//     non-token endpoints). Release is fire-and-forget; a slot whose
+//     release never runs is reclaimed by the stale window instead.
 //
 // Requirement: gpustack-rate-limit must run after the plugin that publishes
 // "ai_log" in the response-phase filter order.
 func onHttpStreamDone(ctx wrapper.HttpContext, config PluginConfig) {
 	pending, ok := ctx.GetContext(ctxKeyTokenPending).([]tokenPendingAdd)
-	if !ok || len(pending) == 0 {
-		return
-	}
-	tokens := readTotalTokensFromAILog()
-	if tokens <= 0 {
-		proxywasm.LogDebugf("%s: total_token unavailable from filter state %q, token-limits add skipped",
-			pluginName, wrapper.AILogKey)
-		return
-	}
-	member := ctx.GetStringContext(ctxKeyRequestID, uuid.NewString())
-	proxywasm.LogDebugf("%s: stream done, req=%s tokens=%d pending=%d",
-		pluginName, member, tokens, len(pending))
+	if ok && len(pending) > 0 {
+		tokens := readTotalTokensFromAILog()
+		if tokens <= 0 {
+			proxywasm.LogDebugf("%s: total_token unavailable from filter state %q, token-limits add skipped",
+				pluginName, wrapper.AILogKey)
+		} else {
+			member := ctx.GetStringContext(ctxKeyRequestID, uuid.NewString())
+			proxywasm.LogDebugf("%s: stream done, req=%s tokens=%d pending=%d",
+				pluginName, member, tokens, len(pending))
 
-	nowTime := time.Now()
-	addEntries := make([]LimitEntry, 0, len(pending))
-	for _, p := range pending {
-		addEntries = append(addEntries, LimitEntry{
-			Key:    p.Key,
-			Window: p.windowSeconds(nowTime),
-			Quota:  p.Quota,
-			Mode:   modeAdd,
-			Member: member,
-			Count:  tokens,
-			TTL:    p.ttlSeconds(nowTime),
-			Combo:  p.Combo,
-			Kind:   p.Kind,
-			Bucket: p.Bucket,
-		})
-	}
+			nowTime := time.Now()
+			addEntries := make([]LimitEntry, 0, len(pending))
+			for _, p := range pending {
+				addEntries = append(addEntries, LimitEntry{
+					Key:    p.Key,
+					Window: p.windowSeconds(nowTime),
+					Quota:  p.Quota,
+					Mode:   modeAdd,
+					Member: member,
+					Count:  tokens,
+					TTL:    p.ttlSeconds(nowTime),
+					Combo:  p.Combo,
+					Kind:   p.Kind,
+					Bucket: p.Bucket,
+				})
+			}
 
-	if _, err := config.Backend.BatchEval(nowTime.Unix(), addEntries, nil); err != nil {
-		proxywasm.LogWarnf("%s: token-limits add dispatch failed: %v", pluginName, err)
-		return
-	}
-	// Successful add (sync for local, fire-and-forget for redis): record the
-	// per-bucket token consumption. The redis async path may not have actually
-	// committed yet by the time we increment, but BatchEval returning nil error
-	// is the closest "intent to write" signal we have without plumbing a
-	// response callback for add-only flows.
-	ai, ok := ctx.GetContext(ctxKeyAILabels).(aiLabels)
-	if !ok {
-		// Onthe rare path where the request-headers handler did not run (e.g.
-		// the request was short-circuited before our phase), fall back to the
-		// "none" sentinel for every slot so the stat name is still emittable.
-		ai = aiLabels{
-			Route:    metricNoneLabel,
-			Cluster:  metricNoneLabel,
-			Model:    metricNoneLabel,
-			Consumer: metricNoneLabel,
+			if _, err := config.Backend.BatchEval(nowTime.Unix(), addEntries, nil); err != nil {
+				proxywasm.LogWarnf("%s: token-limits add dispatch failed: %v", pluginName, err)
+			} else {
+				// Successful add (sync for local, fire-and-forget for redis):
+				// record the per-bucket token consumption. The redis async
+				// path may not have actually committed yet by the time we
+				// increment, but BatchEval returning nil error is the closest
+				// "intent to write" signal we have without plumbing a
+				// response callback for add-only flows.
+				ai, ok := ctx.GetContext(ctxKeyAILabels).(aiLabels)
+				if !ok {
+					// On the rare path where the request-headers handler did not run (e.g.
+					// the request was short-circuited before our phase), fall back to the
+					// "none" sentinel for every slot so the stat name is still emittable.
+					ai = aiLabels{
+						Route:    metricNoneLabel,
+						Cluster:  metricNoneLabel,
+						Model:    metricNoneLabel,
+						Consumer: metricNoneLabel,
+					}
+				}
+				for _, p := range pending {
+					emitValue(ai, config.RuleName, p.Combo, p.Kind, p.Period, p.Bucket, uint64(tokens))
+				}
+			}
 		}
 	}
-	for _, p := range pending {
-		emitValue(ai, config.RuleName, p.Combo, p.Kind, p.Period, p.Bucket, uint64(tokens))
+
+	// Release every concurrency slot this request holds. Independent of the
+	// token path: a rejected-by-us request (LIMITED never wrote the member),
+	// a failed dispatch, or a non-token response must all still free the
+	// slots the request actually acquired, and ZREM of an absent member is a
+	// harmless no-op.
+	releaseConcurrencyHeld(ctx, config)
+}
+
+// releaseConcurrencyHeld emits the release eval for the slots recorded at
+// the request phase. Errors are logged and swallowed: the stale window is
+// the safety net for a release that never lands, and by stream end there is
+// no request left to fail.
+func releaseConcurrencyHeld(ctx wrapper.HttpContext, config PluginConfig) {
+	held, ok := ctx.GetContext(ctxKeyConcurrencyHeld).([]concurrencyHeld)
+	if !ok || len(held) == 0 {
+		return
+	}
+	releaseEntries := make([]LimitEntry, 0, len(held))
+	for _, h := range held {
+		releaseEntries = append(releaseEntries, LimitEntry{
+			Key:    h.Key,
+			Mode:   modeRelease,
+			Member: h.Member,
+			// The lua script encodes ZSET members as "<member>|<count>", so
+			// ZREM must target the same encoded form the acquire wrote
+			// (count is always 1 for a concurrency slot). Window must be the
+			// stale window, not zero: the script's prune pass runs for every
+			// entry and `now - 0` would evict every member of the ZSET,
+			// releasing every running request's slot in one stroke.
+			Count:  1,
+			Window: concurrencyStale(&config),
+			Kind:   metricKindConcurrency,
+		})
+	}
+	if _, err := config.Backend.BatchEval(time.Now().Unix(), releaseEntries, nil); err != nil {
+		proxywasm.LogWarnf("%s: concurrency release dispatch failed: %v", pluginName, err)
 	}
 }
 
