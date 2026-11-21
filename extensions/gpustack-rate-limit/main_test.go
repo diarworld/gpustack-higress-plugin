@@ -971,6 +971,91 @@ func TestBuildRejectedHeaders(t *testing.T) {
 	})
 }
 
+func TestRejectedMessageFor(t *testing.T) {
+	cases := []struct {
+		name   string
+		kind   string
+		period string
+		want   string
+	}{
+		{"query per minute", metricKindQuery, "60s", "Too many requests per minute"},
+		{"query per second", metricKindQuery, "1s", "Too many requests per second"},
+		{"query per hour", metricKindQuery, "3600s", "Too many requests per hour"},
+		{"query per day", metricKindQuery, "86400s", "Too many requests per day"},
+		{"query unknown window stays generic", metricKindQuery, "90s", "Too many requests"},
+		{"tokens per minute", metricKindTokenRolling, "60s", "Too many tokens per minute"},
+		{"weekly token quota", metricKindTokenRolling, "604800s", rejectedMsgWeeklyTokenQuota},
+		{"rolling unknown window stays generic", metricKindTokenRolling, "90s", "Too many requests"},
+		{"daily calendar quota", metricKindTokenCalendar, "each_day", rejectedMsgDailyTokenQuota},
+		{"monthly calendar quota", metricKindTokenCalendar, "each_month", rejectedMsgMonthlyTokenQuota},
+		{"yearly calendar quota", metricKindTokenCalendar, "each_year", rejectedMsgYearlyTokenQuota},
+		{"calendar unknown period stays generic", metricKindTokenCalendar, "each_week", "Too many requests"},
+		{"concurrency", metricKindConcurrency, "3600s", rejectedMsgConcurrency},
+		{"unknown kind stays generic", "mystery", "60s", "Too many requests"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rejectedMessageFor(PluginConfig{}, &LimitEntry{Kind: tc.kind, Period: tc.period})
+			if got != tc.want {
+				t.Errorf("message=%q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("nil entry falls back to generic", func(t *testing.T) {
+		got := rejectedMessageFor(PluginConfig{}, nil)
+		if got != defaultRejectedMsg {
+			t.Errorf("message=%q, want %q", got, defaultRejectedMsg)
+		}
+	})
+
+	t.Run("operator message wins over per-limit text", func(t *testing.T) {
+		got := rejectedMessageFor(PluginConfig{RejectedMsg: "Try later"},
+			&LimitEntry{Kind: metricKindConcurrency, Period: "3600s"})
+		if got != "Try later" {
+			t.Errorf("message=%q, want the operator-pinned %q", got, "Try later")
+		}
+	})
+}
+
+func TestRejectedCodeFor(t *testing.T) {
+	if got := rejectedCodeFor(PluginConfig{}); got != defaultRejectedCode {
+		t.Errorf("default code=%d, want %d", got, defaultRejectedCode)
+	}
+	if got := rejectedCodeFor(PluginConfig{RejectedCode: 503}); got != 503 {
+		t.Errorf("pinned code=%d, want 503", got)
+	}
+}
+
+func TestRetryAfterSeconds(t *testing.T) {
+	cases := []struct {
+		name  string
+		entry *LimitEntry
+		want  int
+	}{
+		{"no entry carries no header", nil, 0},
+		{"rolling query waits one window",
+			&LimitEntry{Kind: metricKindQuery, Window: 60}, 60},
+		{"weekly rolling waits one window",
+			&LimitEntry{Kind: metricKindTokenRolling, Window: 604800}, 604800},
+		{"calendar waits until period boundary",
+			&LimitEntry{Kind: metricKindTokenCalendar, TTL: 86400 + ttlGraceSeconds}, 86400},
+		{"calendar ttl below grace waits unknown",
+			&LimitEntry{Kind: metricKindTokenCalendar, TTL: ttlGraceSeconds - 1}, 0},
+		{"concurrency carries no header",
+			&LimitEntry{Kind: metricKindConcurrency, Window: 3600}, 0},
+		{"unknown kind carries no header",
+			&LimitEntry{Kind: "mystery", Window: 60}, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := retryAfterSeconds(tc.entry); got != tc.want {
+				t.Errorf("retry-after=%d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestMatchPathFilters(t *testing.T) {
 	defaultCfg := &PluginConfig{
 		EnableOnPathSuffix: []string{"/completions", "/messages"},

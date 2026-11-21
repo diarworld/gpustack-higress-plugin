@@ -4,6 +4,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +25,18 @@ const (
 	// queued but never flushed to the client).
 	defaultRejectedMsg = "Too many requests"
 	luaSuccessReply    = "SUCCESS"
+
+	// Per-limit rejection messages. The status code stays 429 for every limit
+	// kind -- clients already treat 429 as "back off" -- while the message
+	// names the axis that tripped, so a user hit by the model's in-flight cap
+	// can tell it apart from an exhausted monthly quota. The calendar texts
+	// point at the usage overview because that is where a weekly / monthly
+	// window's reset button lives (redis mode).
+	rejectedMsgWeeklyTokenQuota  = "Weekly token quota limit reached, reset in usage overview"
+	rejectedMsgMonthlyTokenQuota = "Monthly token quota limit reached, reset in usage overview"
+	rejectedMsgDailyTokenQuota   = "Daily token quota limit reached, reset in usage overview"
+	rejectedMsgYearlyTokenQuota  = "Yearly token quota limit reached, reset in usage overview"
+	rejectedMsgConcurrency       = "Too many concurrent requests for this model"
 
 	// Lua script mode identifiers.
 	modeCheckAndAdd = "check_and_add"
@@ -682,7 +695,9 @@ func collectChecks(config *PluginConfig, headers [][2]string, reqID string, nowT
 //
 // Rejection metrics are emitted *after* rejected() so the path between
 // callback entry and SendHttpResponseWithDetail stays minimal -- the same
-// hazard CLAUDE.md flags for the redis async case.
+// hazard CLAUDE.md flags for the redis async case. Locating the tripped entry
+// before rejected() is in-memory work over a handful of entries and does not
+// violate that bound.
 func handleEvalResult(config PluginConfig, ai aiLabels, reqID string, entries []LimitEntry, result EvalResult) {
 	if result.Status == luaSuccessReply {
 		emitRequestOutcome(ai, config.RuleName, metricResultPassed)
@@ -698,14 +713,17 @@ func handleEvalResult(config PluginConfig, ai aiLabels, reqID string, entries []
 		// best and a wasted call on every passed request at worst.
 		return
 	}
-	rejected(config, reqID, result.LimitedKey)
-	emitRequestOutcome(ai, config.RuleName, metricResultLimited)
+	var limited *LimitEntry
 	for i := range entries {
-		e := &entries[i]
-		if e.Key == result.LimitedKey {
-			emitRejected(ai, config.RuleName, e.Combo, e.Kind, e.Period, e.Bucket)
+		if entries[i].Key == result.LimitedKey {
+			limited = &entries[i]
 			break
 		}
+	}
+	rejected(config, reqID, limited, result.LimitedKey)
+	emitRequestOutcome(ai, config.RuleName, metricResultLimited)
+	if limited != nil {
+		emitRejected(ai, config.RuleName, limited.Combo, limited.Kind, limited.Period, limited.Bucket)
 	}
 }
 
@@ -731,21 +749,24 @@ func handleEvalResult(config PluginConfig, ai aiLabels, reqID string, entries []
 // `{"error":{...}}` shape is also what real OpenAI / Higress AI clients expect
 // for HTTP-level errors, so this doubles as a usability improvement.
 //
+// The status code is 429 unless the operator pinned rejected_code explicitly.
+// The message names the limit axis that tripped (rejectedMessage) unless the
+// operator pinned rejected_msg explicitly. The Retry-After header carries the
+// reset estimate for the axis (retryAfterSeconds); it is sent unconditionally
+// -- unlike the limited-key echo it carries no identity information.
+//
 // The x-ratelimit-limited-key header echoes the Redis key that triggered the
 // rejection. It is gated on ShowLimitQuotaHeader (default false) because the
 // key fragment may include sensitive identifiers (consumer / api_key / user-id)
 // that we don't want to leak to arbitrary downstream clients by default.
-func rejected(config PluginConfig, reqID, limitedKey string) {
-	code := config.RejectedCode
-	if code == 0 {
-		code = defaultRejectedCode
-	}
-	msg := config.RejectedMsg
-	if msg == "" {
-		msg = defaultRejectedMsg
-	}
+func rejected(config PluginConfig, reqID string, limited *LimitEntry, limitedKey string) {
+	code := rejectedCodeFor(config)
+	msg := rejectedMessageFor(config, limited)
 	body := buildRejectedBody(msg, code)
 	headers := buildRejectedHeaders(config, limitedKey)
+	if wait := retryAfterSeconds(limited); wait > 0 {
+		headers = append(headers, [2]string{"retry-after", strconv.Itoa(wait)})
+	}
 	headers = append(headers, [2]string{"content-type", "application/json"})
 	proxywasm.LogInfof("%s: rate limit exceeded, req=%s key=%s", pluginName, reqID, limitedKey)
 	if err := proxywasm.SendHttpResponseWithDetail(
@@ -763,6 +784,118 @@ func rejected(config PluginConfig, reqID, limitedKey string) {
 		// concerns hostcalls BEFORE SendHttpResponseWithDetail, not after).
 		proxywasm.LogWarnf("%s: SendHttpResponseWithDetail failed for req=%s: %v", pluginName, reqID, err)
 	}
+}
+
+// rejectedCodeFor resolves the rejection status code. Every limit axis shares
+// 429 unless the operator pinned rejected_code explicitly.
+func rejectedCodeFor(config PluginConfig) int {
+	if config.RejectedCode != 0 {
+		return config.RejectedCode
+	}
+	return defaultRejectedCode
+}
+
+// rejectedMessageFor resolves the rejection body text. Priority: an
+// operator-pinned rejected_msg, then the per-limit text for the entry that
+// tripped, then the generic message. An operator-set message keeps priority
+// over the per-limit texts because the server no longer sends one by default
+// -- a deployment that sees only generic text pinned it deliberately.
+func rejectedMessageFor(config PluginConfig, limited *LimitEntry) string {
+	if config.RejectedMsg != "" {
+		return config.RejectedMsg
+	}
+	if limited != nil {
+		if perLimit := rejectedMessage(limited.Kind, limited.Period); perLimit != "" {
+			return perLimit
+		}
+	}
+	return defaultRejectedMsg
+}
+
+// rejectedMessage maps the limit kind and window period that tripped to a
+// client-facing message naming that axis. An empty return means "no specific
+// text for this (kind, period)" and the caller falls back to the generic
+// message -- unknown periods must not be guessed into a wrong unit.
+func rejectedMessage(kind, period string) string {
+	switch kind {
+	case metricKindQuery:
+		if phrase := rollingWindowPhrase(period); phrase != "" {
+			return "Too many requests " + phrase
+		}
+	case metricKindTokenRolling:
+		// The long token budgets are rolling windows whose length is the
+		// budget period; users know them as quotas, not rates.
+		switch period {
+		case "604800s":
+			return rejectedMsgWeeklyTokenQuota
+		}
+		if phrase := rollingWindowPhrase(period); phrase != "" {
+			return "Too many tokens " + phrase
+		}
+	case metricKindTokenCalendar:
+		switch period {
+		case "each_day":
+			return rejectedMsgDailyTokenQuota
+		case "each_month":
+			return rejectedMsgMonthlyTokenQuota
+		case "each_year":
+			return rejectedMsgYearlyTokenQuota
+		}
+	case metricKindConcurrency:
+		return rejectedMsgConcurrency
+	}
+	return ""
+}
+
+// rollingWindowPhrase maps a rolling window length (the "<seconds>s" key
+// fragment) to its client-facing phrase.
+func rollingWindowPhrase(period string) string {
+	switch period {
+	case "1s":
+		return "per second"
+	case "60s":
+		return "per minute"
+	case "3600s":
+		return "per hour"
+	case "86400s":
+		return "per day"
+	}
+	return ""
+}
+
+// retryAfterSeconds estimates how long a rejected client should wait before
+// retrying, from the limit entry that tripped:
+//
+//   - Rolling windows (query / token_rolling) admit again once enough old
+//     members age out, which happens within one window of the rejection --
+//     the window length is the honest worst case.
+//   - Calendar token quotas reset at the period boundary. The key TTL tracks
+//     that boundary plus the write grace, so the boundary distance is
+//     TTL minus grace.
+//
+// A concurrency rejection carries no header: a slot frees when one of the
+// in-flight requests completes, at a moment the plugin cannot observe, and
+// the stale window (an hour by default) would overstate the wait by orders
+// of magnitude. Clients that back off on 429 without the header do so on
+// their own schedule, which is the best estimate available here.
+//
+// Returns 0 when no honest estimate exists (nil entry, non-positive window).
+func retryAfterSeconds(limited *LimitEntry) int {
+	if limited == nil {
+		return 0
+	}
+	switch limited.Kind {
+	case metricKindQuery, metricKindTokenRolling:
+		if limited.Window > 0 {
+			return int(limited.Window)
+		}
+	case metricKindTokenCalendar:
+		reset := limited.TTL - ttlGraceSeconds
+		if reset > 0 {
+			return int(reset)
+		}
+	}
+	return 0
 }
 
 // buildRejectedBody returns the JSON envelope used as the rate-limit rejection

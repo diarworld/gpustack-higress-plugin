@@ -79,7 +79,7 @@ This matches the runtime properties of Higress's `ai-token-ratelimit` plugin.
 | `rule_name`                | string              | Yes      | -                    | Rate-limit rule name; used as the Redis key prefix. Should be unique across rule-level overrides that need independent counters.                 |
 | `limit_combinations`       | array of object     | Yes\*    | -                    | List of rate-limit combinations. Required at rule-level. Optional at global-level when the global config only provides base fields (e.g. Redis). |
 | `rejected_code`            | int                 | No       | `429`                | HTTP status code returned when a request is rejected. Must fall in `[100, 599]`.                                                                 |
-| `rejected_msg`             | string              | No       | `Too many requests`  | Human-readable error message. Wrapped into a JSON envelope; see [Rejection response shape](#rejection-response-shape). Must be non-empty.        |
+| `rejected_msg`             | string              | No       | per-limit texts      | Human-readable error message. When unset, the message names the limit axis that tripped (see [Rejection response shape](#rejection-response-shape)). Wrapped into a JSON envelope; must be non-empty. An explicit value overrides the per-limit texts. |
 | `show_limit_quota_header`  | bool                | No       | `false`              | When true, the rejected response carries the header `x-ratelimit-limited-key` whose value is the Redis key that triggered the rejection.         |
 | `enable_on_path_suffix`    | array of string     | No       | AI endpoints\*\*     | Only enforce the limit when `:path` ends with one of these suffixes (after stripping the query string). `"*"` matches any path.                  |
 | `enable_on_path_prefix`    | array of string     | No       | `["/model/proxy"]`   | Only enforce the limit when `:path` starts with one of these prefixes. An empty string `""` matches any path.                                    |
@@ -416,11 +416,32 @@ error envelope:
 }
 ```
 
-- `message` is `rejected_msg` (default `Too many requests`).
+- `message` is `rejected_msg` when the operator pinned it. When unset, it
+  names the limit axis that tripped:
+
+  | Limit kind       | Period                            | Message                                                                       |
+  | ---------------- | --------------------------------- | ----------------------------------------------------------------------------- |
+  | `query`          | rolling window                    | `Too many requests per second / minute / hour / day`                          |
+  | `token_rolling`  | `604800s`                         | `Weekly token quota limit reached, reset in usage overview`                   |
+  | `token_rolling`  | rolling window                    | `Too many tokens per second / minute / hour / day`                            |
+  | `token_calendar` | `each_day` / `each_month` / `each_year` | `Daily / Monthly / Yearly token quota limit reached, reset in usage overview` |
+  | `concurrency`    | -                                 | `Too many concurrent requests for this model`                                 |
+
+  Unrecognized kind / period combinations fall back to the generic
+  `Too many requests` rather than guessing the unit.
 - `code` is `rejected_code` (default `429`).
 - `type` is always `rate_limit_exceeded`.
 
-The status code of the HTTP response is also `rejected_code`.
+The status code of the HTTP response is also `rejected_code` (429 unless
+overridden).
+
+Rejections also carry a `retry-after` header whenever the wait is honestly
+estimable from the tripped limit: rolling windows send their window length
+(the worst case until enough members age out), calendar quotas send the
+seconds to the period boundary. Concurrency rejections carry no header --
+a slot frees when one of the in-flight requests completes, at a moment the
+plugin cannot observe, and the stale window would overstate the wait by
+orders of magnitude.
 
 To override the body schema entirely, set `rejected_msg` to a JSON object
 literal. It is detected by the leading `{` and `json.Valid`, and is sent
