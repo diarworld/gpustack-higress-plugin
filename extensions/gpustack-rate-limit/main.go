@@ -336,6 +336,17 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Ac
 	ctx.SetContext(ctxKeyAILabels, ai)
 
 	nowTime := time.Now()
+	if config.InFreeWindow(nowTime) {
+		// Free window: every check is suspended for this request. The
+		// admission-time regime is final -- a stream that started inside the
+		// window runs uncounted even if it streams past the window's end,
+		// and one that started outside stays fully checked (see
+		// collectChecks, which mirrors this gate so the policy holds for
+		// every caller).
+		emitFreeSkipped(ai, config.RuleName)
+		proxywasm.LogDebugf("%s: req=%s free window active, limits suspended", pluginName, reqID)
+		return types.ActionContinue
+	}
 	entries, pending, held := collectChecks(&config, headers, reqID, nowTime)
 	if len(pending) > 0 {
 		ctx.SetContext(ctxKeyTokenPending, pending)
@@ -508,6 +519,15 @@ func concurrencyStale(config *PluginConfig) int64 {
 }
 
 func collectChecks(config *PluginConfig, headers [][2]string, reqID string, nowTime time.Time) (entries []LimitEntry, pending []tokenPendingAdd, held []concurrencyHeld) {
+	// Free window: suspend every check for requests admitted there. All
+	// three results stay empty, which suspends the whole chain -- no eval
+	// entries, no concurrency slots acquired, no pending token add for the
+	// stream-done phase. The same gate runs in onHttpRequestHeaders for the
+	// observability counter; this one keeps the policy true for every
+	// direct caller.
+	if config.InFreeWindow(nowTime) {
+		return nil, nil, nil
+	}
 	var nonFallback, fallback []matchedCombo
 	for i := range config.LimitCombinations {
 		combo := &config.LimitCombinations[i]

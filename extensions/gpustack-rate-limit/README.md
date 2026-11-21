@@ -85,6 +85,7 @@ This matches the runtime properties of Higress's `ai-token-ratelimit` plugin.
 | `enable_on_path_prefix`    | array of string     | No       | `["/model/proxy"]`   | Only enforce the limit when `:path` starts with one of these prefixes. An empty string `""` matches any path.                                    |
 | `timezone`                 | string              | No       | `UTC`                | IANA timezone name (e.g. `Asia/Shanghai`) used to anchor every calendar-aligned `token_quota` boundary in this config. Deployment-wide.          |
 | `concurrency_stale_seconds` | int                | No       | `3600`               | Age at which an in-flight request is assumed dead and its concurrency slot reclaimed: bounds the ZSET prune on every acquire and the key TTL (2x). Raise it for streams expected to legitimately outlive the default. Minimum `60`. |
+| `free_windows`             | object              | No       | -                    | Schedule during which rate limiting is suspended entirely (see [`free_windows` fields](#free_windows-fields)). Requests admitted there run no checks, acquire no concurrency slots and add nothing to the limit counters. |
 | `redis`                    | object              | No       | -                    | Redis connection settings. When omitted the plugin runs in **local mode** (per-instance counters). See [Backend Modes](#backend-modes).          |
 
 \* Global-level configuration is allowed to omit `limit_combinations` -- in that
@@ -125,6 +126,33 @@ enable_on_path_suffix: ["*"]
 
 An explicitly provided empty array `[]` opts out of that specific filter while
 keeping the other one; the overall enable decision is the OR of both lists.
+
+### `free_windows` fields
+
+| Field    | Type            | Required | Default | Description                                                                                                          |
+| -------- | --------------- | -------- | ------- | -------------------------------------------------------------------------------------------------------------------- |
+| `enabled`| bool            | Yes      | `false` | Gates the schedule; `false` makes the block inert even when present.                                                  |
+| `start`  | string          | Yes      | -       | Daily window start, `"HH:MM"` in the plugin-wide `timezone`.                                                          |
+| `end`    | string          | Yes      | -       | Daily window end, `"HH:MM"`. A `start` later than `end` wraps past midnight (`15:00` -> `06:00` spans the night).     |
+| `days`   | array of string | No       | -       | Whole free days, `"mon"`..`"sun"`. Optional: an empty list applies only the daily window, every day.                  |
+
+The schedule and the daily window compose as OR: on a listed day everything is
+free, and on any day the window hours are free. Requests admitted inside the
+schedule skip every check (`free_skipped_total` counts them), occupy no
+concurrency slots and leave no pending token add behind, so the limit counters
+freeze for the duration. The admission-time regime is final: a stream that
+started inside the window stays uncounted even if it streams past the window's
+end, and one that started outside stays fully checked. Response statistics
+produced by other plugins (`ai_log` / ai-statistics) are unaffected -- only
+this plugin's limit accounting stops.
+
+```yaml
+free_windows:
+  enabled: true
+  start: "15:00"
+  end: "06:00"
+  days: ["sat", "sun"]
+```
 
 ### `limit_combinations` fields
 
@@ -473,6 +501,7 @@ Prometheus through Higress's existing stats sink, become standard
 | ------------------------------------ | ----------------------- | ----------------------------------------------------------------------------- |
 | `gpustack_rate_limit_request_total`  | 1 per request           | Once per request that ran rate-limit checks; labelled with `result`           |
 | `gpustack_rate_limit_rejected_total` | 1 per rejected request  | When lua / local backend short-circuits with LIMITED; tripping combo labelled |
+| `gpustack_rate_limit_free_skipped_total` | 1 per request       | Once per request admitted inside a `free_windows` schedule: it ran no checks and appears in neither `request_total` nor `rejected_total` |
 | `gpustack_rate_limit_value_total`    | The lua `count` written | Per declared window/period bucket that the request wrote into. A combo with stacked windows (e.g. `per_second` + `per_minute`) writes once per window per request, so `sum by (kind) (value_total)` is **not** request count when stacking is in use — pin the `period` label (or use `request_total` for request rate). |
 
 `sum by (route) (gpustack_rate_limit_rejected_total)` always equals

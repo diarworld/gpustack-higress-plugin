@@ -65,12 +65,136 @@ type PluginConfig struct {
 	// streams expected to outlive the default should raise it.
 	ConcurrencyStaleSeconds int64 `json:"concurrency_stale_seconds,omitempty"`
 
+	// FreeWindows suspends rate limiting during configured windows: any
+	// request admitted inside one skips every check, occupies no
+	// concurrency slot and adds nothing to the limit counters. Response
+	// statistics produced by the ai-statistics plugin are unaffected --
+	// only this plugin's limit accounting stops.
+	FreeWindows *FreeWindowConfig `json:"free_windows,omitempty"`
+
 	// Backend is the rate-limit storage backend (not part of JSON).
 	// Set to a redisBackend when "redis" is present in config, otherwise localBackend.
 	Backend LimitBackend `json:"-"`
 
 	// location is the resolved Timezone (or UTC), populated by Validate.
 	location *time.Location
+}
+
+// ============================================
+// Free windows (deployment-wide limit bypass)
+// ============================================
+
+// weekdayNames maps the day tokens accepted in free_windows.days onto
+// time.Weekday values.
+var weekdayNames = map[string]time.Weekday{
+	"mon": time.Monday,
+	"tue": time.Tuesday,
+	"wed": time.Wednesday,
+	"thu": time.Thursday,
+	"fri": time.Friday,
+	"sat": time.Saturday,
+	"sun": time.Sunday,
+}
+
+// FreeWindowConfig declares the deployment-wide schedule in which rate
+// limiting is suspended: a whole free day suspends everything on that day,
+// and the daily window (which may wrap past midnight) suspends everything
+// inside it. Requests admitted there run no checks, acquire no concurrency
+// slots and leave no pending token add behind, so the limit counters stay
+// frozen while the window lasts.
+type FreeWindowConfig struct {
+	// Enabled gates the schedule; false makes the block inert even when
+	// present.
+	Enabled bool `json:"enabled"`
+
+	// Start anchors the daily window, "HH:MM" in the plugin-wide timezone.
+	Start string `json:"start"`
+
+	// End closes the daily window, "HH:MM"; a Start later than End wraps
+	// past midnight (e.g. 15:00 -> 06:00 spans the night).
+	End string `json:"end"`
+
+	// Days lists the whole free days, "mon".."sun". Optional: an empty list
+	// applies only the daily window, every day.
+	Days []string `json:"days,omitempty"`
+
+	// startMin / endMin are the parsed minute-of-day values (0..1439),
+	// populated by Validate.
+	startMin int
+	endMin   int
+
+	// daySet marks the parsed whole free days, populated by Validate.
+	daySet [7]bool
+}
+
+// validate parses and pre-compiles the schedule, or reports the first
+// problem. Called from PluginConfig.Validate with the plugin-wide timezone
+// already resolved (times are compared against it, not parsed against it --
+// "HH:MM" is zone-free).
+func (f *FreeWindowConfig) validate() error {
+	start, err := parseHHMM(f.Start)
+	if err != nil {
+		return fmt.Errorf("start %q: %w", f.Start, err)
+	}
+	end, err := parseHHMM(f.End)
+	if err != nil {
+		return fmt.Errorf("end %q: %w", f.End, err)
+	}
+	if start == end {
+		return errors.New("start and end must differ")
+	}
+	f.startMin, f.endMin = start, end
+	for _, d := range f.Days {
+		wd, ok := weekdayNames[strings.ToLower(strings.TrimSpace(d))]
+		if !ok {
+			return fmt.Errorf("unknown day %q (want mon..sun)", d)
+		}
+		f.daySet[wd] = true
+	}
+	return nil
+}
+
+// parseHHMM reads a "HH:MM" wall-clock string into a minute-of-day value.
+func parseHHMM(s string) (int, error) {
+	t, err := time.Parse("15:04", s)
+	if err != nil {
+		return 0, errors.New("must be HH:MM (00:00..23:59)")
+	}
+	return t.Hour()*60 + t.Minute(), nil
+}
+
+// InFreeWindow reports whether now falls inside the configured schedule: a
+// whole free day, or the daily window (start inclusive, end exclusive,
+// wrapping past midnight). Evaluated in the plugin-wide timezone resolved by
+// Validate -- the same zone that anchors the calendar quotas, so the free
+// schedule and the budget boundaries cannot drift apart.
+func (f *FreeWindowConfig) InFreeWindow(now time.Time, loc *time.Location) bool {
+	if !f.Enabled {
+		return false
+	}
+	if loc == nil {
+		loc = time.UTC
+	}
+	t := now.In(loc)
+	if f.daySet[t.Weekday()] {
+		return true
+	}
+	minOfDay := t.Hour()*60 + t.Minute()
+	if f.startMin < f.endMin {
+		return minOfDay >= f.startMin && minOfDay < f.endMin
+	}
+	// Wrap past midnight: [start, 24:00) plus [00:00, end).
+	return minOfDay >= f.startMin || minOfDay < f.endMin
+}
+
+// InFreeWindow reports whether the plugin-wide free schedule covers now
+// (always false when free_windows is absent or disabled). See
+// FreeWindowConfig.InFreeWindow for the schedule semantics.
+func (c *PluginConfig) InFreeWindow(now time.Time) bool {
+	if c.FreeWindows == nil {
+		return false
+	}
+	return c.FreeWindows.InFreeWindow(now, c.location)
 }
 
 // ============================================
@@ -832,6 +956,11 @@ func (c *PluginConfig) Validate() error {
 			"concurrency_stale_seconds %d below minimum %d",
 			c.ConcurrencyStaleSeconds, concurrencyMinStaleSeconds,
 		)
+	}
+	if c.FreeWindows != nil {
+		if err := c.FreeWindows.validate(); err != nil {
+			return fmt.Errorf("free_windows: %w", err)
+		}
 	}
 	seen := make(map[string]struct{}, len(c.LimitCombinations))
 	for i := range c.LimitCombinations {

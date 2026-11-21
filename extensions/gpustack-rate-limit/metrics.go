@@ -14,6 +14,10 @@ const (
 	metricNameRejectedTotal = "gpustack_rate_limit_rejected_total"
 	metricNameValueTotal    = "gpustack_rate_limit_value_total"
 
+	// Requests admitted inside a configured free window: the plugin ran no
+	// checks and will do no limit accounting for them.
+	metricNameFreeSkippedTotal = "gpustack_rate_limit_free_skipped_total"
+
 	// Per-quota-kind label values used by rejected_total / value_total.
 	metricKindQuery         = "query"
 	metricKindTokenRolling  = "token_rolling"
@@ -186,6 +190,17 @@ func emitRequestOutcome(ai aiLabels, rule, result string) {
 	incrCounter(ai.statName(metricNameRequestTotal,
 		[2]string{"rule", rule},
 		[2]string{"result", result},
+	), 1)
+}
+
+// emitFreeSkipped increments free_skipped_total once per request admitted
+// inside a configured free window. These requests never reach the eval path
+// (collectChecks returns nothing for them), so they appear in neither
+// request_total nor rejected_total -- this counter is the only record that
+// the gateway handled them.
+func emitFreeSkipped(ai aiLabels, rule string) {
+	incrCounter(ai.statName(metricNameFreeSkippedTotal,
+		[2]string{"rule", rule},
 	), 1)
 }
 
