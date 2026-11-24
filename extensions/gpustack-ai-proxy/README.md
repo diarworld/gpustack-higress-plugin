@@ -14,8 +14,11 @@ description: AI 代理插件配置参考
 >
 > **本地改动**：
 >
-> - 修复 Claude→OpenAI 协议转换时多个 `system` 消息未合并、导致严格 OpenAI 后端（如 vLLM）
->   报 `System message must be at the beginning.` 的问题（见 gpustack/gpustack#5934）。
+> - 修复 Claude→OpenAI 协议转换把 `messages[]` 中的内联 `system` 消息提升到索引 0、
+>   从而让动态提醒每轮改写稳定前缀并破坏 prefix cache 的问题。顶层 `system` 保持在前，
+>   其余 `system` 的内容与 `cache_control` 会保留并降级/合入相邻 `user` 消息；工具调用与
+>   工具结果之间不会被插入 `user`，同时满足严格 OpenAI 后端（如 vLLM）对消息位置和角色的要求。
+>   注意：内联提醒不再具有顶层 `system` 的指令优先级（见 gpustack/gpustack#5934）。
 > - 为 deepseek provider 的默认能力补充 `ApiNameResponses`，DeepSeek 原生提供 OpenAI Responses API。
 > - 在 `capabilities` 白名单中放行三个 Anthropic 能力（`anthropic/v1/messages`、
 >   `anthropic/v1/messages/count_tokens`、`anthropic/v1/complete`），使原生支持 Claude 协议的
@@ -242,6 +245,16 @@ Fireworks AI 所对应的 `type` 为 `fireworks`。它并无特有的配置字�
 #### Galadriel
 
 Galadriel 所对应的 `type` 为 `galadriel`。它并无特有的配置字段。
+
+#### Systemone（Jev 决策服务）
+
+Systemone 所对应的 `type` 为 `systemone`，用于将 Jev 决策契约（jevcompat SPEC 0.1，`POST /v1/systemone`）作为推理上游。请求路径不做改写（`/v1/systemone` 与 `/v1/models` 直通），Host 头固定为配置的 endpoint 的 authority（缺省为托管 `api.typesafe.ai`）。
+
+特有配置字段：
+
+- `systemoneEndpoint`：Jev 决策服务的 base url；缺省使用托管 TypeSafe API（`https://api.typesafe.ai`）。
+- `systemoneModel`：请求未携带 `model` 字段时使用的默认决策引擎模型。
+- `typesafeDangerZoneHeader`：`TypeSafe-Danger-Zone-Images` opt-in 头的注入策略，取值 `auto`（默认，请求携带图片且客户端未显式发送该头时注入）、`true`（无条件确保该头存在，不覆盖客户端显式发送的值）、`false`（完全不注入）。
 
 #### 文心一言（Baidu）
 
