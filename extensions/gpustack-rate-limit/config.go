@@ -72,6 +72,22 @@ type PluginConfig struct {
 	// only this plugin's limit accounting stops.
 	FreeWindows *FreeWindowConfig `json:"free_windows,omitempty"`
 
+	// ReportEndpoint names the GPUStack server endpoint that receives one
+	// POST per rejected request, so rejections land in the resource-events
+	// UI. Nil (or missing service_name) disables reporting entirely -- the
+	// plugin stays a passthrough for reporting. Lives in the same JSON
+	// shape the token-usage plugin uses for its metrics report endpoint.
+	Endpoint *ReportEndpointConfig `json:"endpoint,omitempty"`
+
+	// HeaderAdd is attached to every rejection-report POST (and nothing
+	// else). The server validates the derived gateway token it carries --
+	// single-sourced from the CR the same way token-usage's report token is.
+	HeaderAdd map[string]string `json:"header_add,omitempty"`
+
+	// ReportClient is the HTTP client for Endpoint, initialized at config
+	// parse time (not part of JSON).
+	ReportClient wrapper.HttpClient `json:"-"`
+
 	// Backend is the rate-limit storage backend (not part of JSON).
 	// Set to a redisBackend when "redis" is present in config, otherwise localBackend.
 	Backend LimitBackend `json:"-"`
@@ -1030,8 +1046,7 @@ func (c *PluginConfig) Validate() error {
 // initRedisBackend reads the "redis" sub-object from raw and returns a
 // redisBackend. The caller must verify that raw.Get("redis") exists before
 // calling; this function treats a missing service_name as an error.
-func initRedisBackend(raw gjson.Result) (LimitBackend, error) {
-	redisConfig := raw.Get("redis")
+func initRedisBackend(raw gjson.Result) (LimitBackend, error) {	redisConfig := raw.Get("redis")
 
 	serviceName := redisConfig.Get("service_name").String()
 	if serviceName == "" {
@@ -1074,4 +1089,35 @@ func initRedisBackend(raw gjson.Result) (LimitBackend, error) {
 		return nil, err
 	}
 	return &redisBackend{client: client}, nil
+}
+
+// ============================================
+// Rejection reporting endpoint
+// ============================================
+
+// ReportEndpointConfig holds the rejection-report endpoint configuration.
+// Same JSON shape as the token-usage plugin's metrics endpoint, so the
+// server renders both blocks through one convention.
+type ReportEndpointConfig struct {
+	ServiceName string `json:"service_name"`
+	ServicePort int64  `json:"service_port,omitempty"`
+	Path        string `json:"path,omitempty"`
+	TimeoutMs   uint32 `json:"timeout_ms,omitempty"`
+}
+
+// initReportClient builds the HTTP client for the report endpoint. A config
+// without a usable endpoint (absent block, or no service_name) leaves
+// ReportClient nil and reporting silently off -- the plugin must never
+// refuse to start because reporting cannot be configured.
+func initReportClient(config *PluginConfig) {
+	if config.Endpoint == nil || config.Endpoint.ServiceName == "" {
+		return
+	}
+	if config.Endpoint.TimeoutMs == 0 {
+		config.Endpoint.TimeoutMs = 5000
+	}
+	config.ReportClient = wrapper.NewClusterClient(wrapper.FQDNCluster{
+		FQDN: config.Endpoint.ServiceName,
+		Port: config.Endpoint.ServicePort,
+	})
 }

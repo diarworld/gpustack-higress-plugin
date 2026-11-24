@@ -443,7 +443,6 @@ error envelope:
   }
 }
 ```
-
 - `message` is `rejected_msg` when the operator pinned it. When unset, it
   names the limit axis that tripped:
 
@@ -486,6 +485,48 @@ priority and parses the response body as SSE chunks for streaming requests
 and silently replaced with an empty body downstream — the client would see
 the rejection headers but no body at all. Keeping the body valid JSON makes
 it pass through that pipeline unchanged.
+
+### Rejection reporting (`endpoint` / `header_add`)
+
+When the `endpoint` block is present, the plugin POSTs one report per
+rejected request to the GPUStack server, so every 429 lands in the
+resource-events UI (Usage → Resource Events, resource type "limit"). The
+same trust channel as the token-usage metrics report: a McpBridge registry
+service validating the derived gateway token carried in `header_add`.
+
+| Field           | Type   | Required | Default | Description                                                                                     |
+| --------------- | ------ | -------- | ------- | ----------------------------------------------------------------------------------------------- |
+| `service_name`  | string | Yes      | -       | Registry service name serving the GPUStack server (e.g. `gpustack.static`).                     |
+| `service_port`  | int    | No       | -       | Registry service port.                                                                          |
+| `path`          | string | No       | `/`     | Report endpoint path (`/v2/usage/gateway-limit-events` for the stock server).                   |
+| `timeout_ms`    | int    | No       | `5000`  | Report dispatch timeout in milliseconds.                                                        |
+
+The payload mirrors the `rejected_total` metric labels, so a UI row can be
+cross-checked against the gateway counters. One POST carries one event inside
+an `events` envelope — the list shape leaves room for batching without a
+wire-format change:
+
+```json
+{
+  "events": [
+    {
+      "occurred_at": "2026-11-24T07:40:31Z",
+      "consumer": "gpustack-3970",
+      "combo": "user-3970",
+      "kind": "token_calendar",
+      "period": "each_month",
+      "model": "qwen3-32b",
+      "route": "route-1"
+    }
+  ]
+}
+```
+
+Reporting is best-effort and fail-open: a dispatch failure (or an endpoint
+that answers non-2xx) is logged and dropped, never surfaced to the caller,
+and a config without the block disables the path entirely. One POST per
+rejection stays proportionate under a rejection storm because the server
+folds bursts into bounded rows.
 
 ## Metrics
 

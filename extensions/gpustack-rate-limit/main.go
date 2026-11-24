@@ -221,6 +221,7 @@ func parseGlobalConfig(raw gjson.Result, config *PluginConfig) error {
 		proxywasm.LogInfof("%s: no redis configured, using local (per-instance) rate limiting mode", pluginName)
 		config.Backend = &localBackend{}
 	}
+	initReportClient(config)
 	if len(config.LimitCombinations) == 0 {
 		return nil
 	}
@@ -265,6 +266,10 @@ func parseOverrideRuleConfig(raw gjson.Result, global PluginConfig, config *Plug
 	config.LimitCombinations = nil
 	config.EnableOnPathSuffix = nil
 	config.EnableOnPathPrefix = nil
+	// Same aliasing hazard for the header map: encoding/json merges into an
+	// existing map, so an override declaring header_add would mutate
+	// global's map through the shared reference.
+	config.HeaderAdd = nil
 
 	if err := json.Unmarshal([]byte(raw.Raw), config); err != nil {
 		return fmt.Errorf("unmarshal rule config: %w", err)
@@ -296,6 +301,11 @@ func parseOverrideRuleConfig(raw gjson.Result, global PluginConfig, config *Plug
 			return err
 		}
 		config.Backend = backend
+	}
+	if raw.Get("endpoint").IsObject() {
+		// A rule-level endpoint redeclaration needs its own client; an
+		// inherited one reuses the client the global config built.
+		initReportClient(config)
 	}
 	return config.Validate()
 }
@@ -745,6 +755,9 @@ func handleEvalResult(config PluginConfig, ai aiLabels, reqID string, entries []
 	if limited != nil {
 		emitRejected(ai, config.RuleName, limited.Combo, limited.Kind, limited.Period, limited.Bucket)
 	}
+	// Fire-and-forget: the rejection is already final, and a report failure
+	// changes nothing about it (see reportLimitEvent).
+	reportLimitEvent(config, ai, limited)
 }
 
 // rejected sends a local reply terminating the request.
